@@ -1,55 +1,77 @@
 const express = require('express');
-const { authenticateToken, authorizeRole } = require('../middleware/auth');
-const Meal = require('../models/Meal');
-const Ingredient = require('../models/Ingredient');
 const router = express.Router();
+const Meal = require('../models/Meal');
+const { authenticateToken } = require('../middleware/auth');
+const { verifyAdmin } = require('../middleware/adminAuth');
 
 /**
- * Get all meals
+ * Get all meals with pagination and filters
  * GET /api/v1/meals
  */
 router.get('/', authenticateToken, async (req, res, next) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 10;
-    const skip = (page - 1) * limit;
+    const { page = 1, limit = 10, search, category, isActive } = req.query;
+    
+    const query = {};
+    
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+    
+    if (category) {
+      query.category = category;
+    }
+    
+    if (isActive !== undefined) {
+      query.isActive = isActive === 'true';
+    }
 
-    const meals = await Meal.find({ isActive: true })
-      .populate('components')
-      .skip(skip)
-      .limit(limit);
+    // Fix: Change 'components' to 'ingredients' to match your schema
+    const meals = await Meal.find(query)
+      .populate('ingredients.ingredient', 'name unit category') // Changed from 'components'
+      .populate('createdBy', 'name email')
+      .populate('updatedBy', 'name email')
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .sort({ createdAt: -1 });
 
-    const total = await Meal.countDocuments({ isActive: true });
+    const count = await Meal.countDocuments(query);
 
-    res.status(200).json({
+    res.json({
       meals,
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
+      totalPages: Math.ceil(count / limit),
+      currentPage: page,
+      total: count
     });
   } catch (error) {
-    console.error('Error fetching meals:', error);
-    next(error); // Pass the error to error handling middleware
+    next(error);
   }
 });
 
 /**
- * Get meal by ID
+ * Get single meal by ID
  * GET /api/v1/meals/:id
  */
 router.get('/:id', authenticateToken, async (req, res, next) => {
   try {
     const meal = await Meal.findById(req.params.id)
-      .populate('components');
+      .populate('ingredients.ingredient', 'name unit category costPrice') // Changed from 'components'
+      .populate('createdBy', 'name email')
+      .populate('updatedBy', 'name email');
 
     if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
+      return res.status(404).json({
+        message: 'Meal not found'
+      });
     }
 
-    res.status(200).json(meal);
+    res.json({
+      meal
+    });
   } catch (error) {
-    console.error('Error fetching meal:', error);
     next(error);
   }
 });
@@ -58,156 +80,223 @@ router.get('/:id', authenticateToken, async (req, res, next) => {
  * Create new meal (admin only)
  * POST /api/v1/meals
  */
-router.post('/', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+router.post('/', authenticateToken, verifyAdmin, async (req, res, next) => {
   try {
     const {
       name,
       description,
-      components,
-      portionSize,
       price,
-      allergens,
+      category,
+      ingredients,
       preparationTime,
+      servingSize,
+      imageUrl,
+      isAvailable,
+      nutritionInfo,
+      allergens
     } = req.body;
 
     // Validate required fields
-    if (!name || !components || !Array.isArray(components) || components.length === 0 || !price) {
-      return res.status(400).json({ message: 'Missing required fields. Name, price, and at least one component are required.' });
+    if (!name || !description || !price || !category) {
+      return res.status(400).json({
+        message: 'Missing required fields: name, description, price, and category are required'
+      });
     }
 
-    // Validate ingredients exist
-    const ingredients = await Ingredient.find({ '_id': { $in: components } });
-    if (ingredients.length !== components.length) {
-        return res.status(404).json({ message: 'One or more ingredients not found' });
+    // Check if meal with same name already exists
+    const existingMeal = await Meal.findOne({ name });
+    if (existingMeal) {
+      return res.status(409).json({
+        message: 'Meal with this name already exists'
+      });
     }
-
-    // Calculate nutrition info
-    const nutritionInfo = calculateNutritionInfo(ingredients);
-
-    // Combine allergens
-    const combinedAllergens = [
-      ...new Set([
-        ...ingredients.flatMap(i => i.allergens || []),
-        ...(allergens || []),
-      ]),
-    ];
 
     const meal = new Meal({
       name,
       description,
-      components,
-      portionSize: portionSize || 1,
       price,
-      allergens: combinedAllergens,
-      preparationTime: preparationTime || 30,
+      category,
+      ingredients: ingredients || [],
+      preparationTime,
+      servingSize,
+      imageUrl,
+      isAvailable,
       nutritionInfo,
+      allergens,
+      createdBy: req.user.userId,
+      updatedBy: req.user.userId
     });
 
     await meal.save();
-    await meal.populate('components');
 
-    res.status(201).json(meal); // Return the created meal
+    // Populate ingredients after saving
+    await meal.populate('ingredients.ingredient', 'name unit category');
+
+    res.status(201).json({
+      message: 'Meal created successfully',
+      meal
+    });
   } catch (error) {
-    console.error('Error creating meal:', error);
     next(error);
   }
 });
 
 /**
- * Update a meal (admin only)
- * PUT /api/v1/meals/:id
+ * Update meal (admin only)
+ * PATCH /api/v1/meals/:id
  */
-router.put('/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+router.patch('/:id', authenticateToken, verifyAdmin, async (req, res, next) => {
   try {
-    const mealId = req.params.id;
-    const updatedData = req.body;
+    const {
+      name,
+      description,
+      price,
+      category,
+      ingredients,
+      preparationTime,
+      servingSize,
+      imageUrl,
+      isAvailable,
+      isActive,
+      nutritionInfo,
+      allergens
+    } = req.body;
 
-    const meal = await Meal.findById(mealId);
+    const meal = await Meal.findById(req.params.id);
 
     if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
+      return res.status(404).json({
+        message: 'Meal not found'
+      });
     }
 
-    // If components are being updated, we need to re-validate and recalculate
-    if (updatedData.components) {
-      if (!Array.isArray(updatedData.components) || updatedData.components.length === 0) {
-        return res.status(400).json({ message: 'Components must be a non-empty array.' });
+    // Check if new name already exists (if name is being changed)
+    if (name && name !== meal.name) {
+      const existingMeal = await Meal.findOne({ name });
+      if (existingMeal) {
+        return res.status(409).json({
+          message: 'Meal with this name already exists'
+        });
       }
-      
-      const ingredients = await Ingredient.find({ '_id': { $in: updatedData.components } });
-      if (ingredients.length !== updatedData.components.length) {
-          return res.status(404).json({ message: 'One or more ingredients not found during update' });
-      }
-
-      // Recalculate nutrition info
-      meal.nutritionInfo = calculateNutritionInfo(ingredients);
-
-      // Re-combine allergens
-      meal.allergens = [
-        ...new Set([
-          ...ingredients.flatMap(i => i.allergens || []),
-          ...(updatedData.allergens || meal.allergens || []),
-        ]),
-      ];
+      meal.name = name;
     }
 
-    // Update other fields
-    meal.name = updatedData.name || meal.name;
-    meal.description = updatedData.description || meal.description;
-    meal.components = updatedData.components || meal.components;
-    meal.portionSize = updatedData.portionSize || meal.portionSize;
-    meal.price = updatedData.price || meal.price;
-    meal.preparationTime = updatedData.preparationTime || meal.preparationTime;
-    if (updatedData.isActive !== undefined) {
-      meal.isActive = updatedData.isActive;
-    }
+    // Update fields only if they are provided
+    if (description !== undefined) meal.description = description;
+    if (price !== undefined) meal.price = price;
+    if (category !== undefined) meal.category = category;
+    if (ingredients !== undefined) meal.ingredients = ingredients;
+    if (preparationTime !== undefined) meal.preparationTime = preparationTime;
+    if (servingSize !== undefined) meal.servingSize = servingSize;
+    if (imageUrl !== undefined) meal.imageUrl = imageUrl;
+    if (isAvailable !== undefined) meal.isAvailable = isAvailable;
+    if (isActive !== undefined) meal.isActive = isActive;
+    if (nutritionInfo !== undefined) meal.nutritionInfo = nutritionInfo;
+    if (allergens !== undefined) meal.allergens = allergens;
 
-    const updatedMeal = await meal.save();
+    meal.updatedBy = req.user.userId;
+    meal.updatedAt = new Date();
 
-    await updatedMeal.populate('components');
+    await meal.save();
 
-    res.status(200).json(updatedMeal);
+    // Populate ingredients after saving
+    await meal.populate('ingredients.ingredient', 'name unit category');
 
+    res.status(200).json({
+      message: 'Meal updated successfully',
+      meal
+    });
   } catch (error) {
-    console.error('Error updating meal:', error);
     next(error);
   }
 });
 
 /**
- * Deactivate a meal (admin only) - Soft Delete
+ * Delete/Deactivate meal (admin only)
  * DELETE /api/v1/meals/:id
  */
-router.delete('/:id', authenticateToken, authorizeRole('admin'), async (req, res, next) => {
+router.delete('/:id', authenticateToken, verifyAdmin, async (req, res, next) => {
   try {
     const meal = await Meal.findById(req.params.id);
 
     if (!meal) {
-      return res.status(404).json({ message: 'Meal not found' });
+      return res.status(404).json({
+        message: 'Meal not found'
+      });
     }
 
-    // Instead of deleting, we'll deactivate it to maintain data integrity
+    // Soft delete by setting isActive to false
     meal.isActive = false;
+    meal.updatedBy = req.user.userId;
     await meal.save();
 
-    res.status(200).json({ message: 'Meal deactivated successfully' });
+    res.status(200).json({
+      message: 'Meal deactivated successfully'
+    });
   } catch (error) {
-    console.error('Error deactivating meal:', error);
     next(error);
   }
 });
 
+/**
+ * Check ingredient availability for a meal
+ * GET /api/v1/meals/:id/availability
+ */
+router.get('/:id/availability', authenticateToken, async (req, res, next) => {
+  try {
+    const { servings = 1 } = req.query;
+    const meal = await Meal.findById(req.params.id);
 
-// Helper function to calculate nutrition info from an array of ingredients
-function calculateNutritionInfo(ingredients) {
-  return ingredients.reduce((acc, ingredient) => {
-    const quantity = ingredient.quantity || 1; // Default to 1 if not specified
-    acc.calories += (ingredient.nutritionInfo.calories || 0) * quantity;
-    acc.protein += (ingredient.nutritionInfo.protein || 0) * quantity;
-    acc.carbs += (ingredient.nutritionInfo.carbs || 0) * quantity;
-    acc.fat += (ingredient.nutritionInfo.fat || 0) * quantity;
-    return acc;
-  }, { calories: 0, protein: 0, carbs: 0, fat: 0 });
-}
+    if (!meal) {
+      return res.status(404).json({
+        message: 'Meal not found'
+      });
+    }
+
+    const isAvailable = await meal.checkIngredientAvailability(parseInt(servings));
+    const requirements = await meal.getIngredientRequirements(parseInt(servings));
+
+    res.json({
+      mealId: meal._id,
+      mealName: meal.name,
+      servings: parseInt(servings),
+      isAvailable,
+      requirements
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * Calculate meal cost
+ * GET /api/v1/meals/:id/cost
+ */
+router.get('/:id/cost', authenticateToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const meal = await Meal.findById(req.params.id);
+
+    if (!meal) {
+      return res.status(404).json({
+        message: 'Meal not found'
+      });
+    }
+
+    const cost = await meal.calculateCost();
+    const profit = meal.price - cost;
+    const profitMargin = ((profit / meal.price) * 100).toFixed(2);
+
+    res.json({
+      mealId: meal._id,
+      mealName: meal.name,
+      cost: cost.toFixed(2),
+      price: meal.price.toFixed(2),
+      profit: profit.toFixed(2),
+      profitMargin: `${profitMargin}%`
+    });
+  } catch (error) {
+    next(error);
+  }
+});
 
 module.exports = router;
