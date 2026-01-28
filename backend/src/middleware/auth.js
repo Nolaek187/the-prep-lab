@@ -12,7 +12,15 @@ const authenticateToken = (req, res, next) => {
     if (err) {
       return res.status(403).json({ message: 'Invalid or expired token' });
     }
-    req.user = user;
+    
+    // NORMALIZE TOKEN PAYLOAD - This is the fix
+    req.user = {
+      userId: user.userId || user._id,  // Ensure userId exists
+      role: user.role,
+      email: user.email,
+      ...user  // Keep all other fields from token
+    };
+    
     next();
   });
 };
