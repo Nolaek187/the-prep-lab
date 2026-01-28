@@ -5,20 +5,19 @@ const dotenv = require('dotenv');
 const errorHandler = require('./middleware/errorHandler');
 const logger = require('./middleware/logger');
 
-
 // Route files
 const authRoutes = require('./routes/auth');
 const mealRoutes = require('./routes/meal');
 const ingredientRoutes = require('./routes/ingredients');
 const adminRoutes = require('./routes/admin');
-const usersRoutes=  require('./routes/users');
+const usersRoutes = require('./routes/users');
+const foodOrdersRoutes = require('./routes/foodOrders');
 
 // Load environment variables
 dotenv.config();
 
 // Initialize Express app
 const app = express();
-
 
 // Middleware
 app.use(cors({
@@ -46,6 +45,7 @@ app.use('/api/v1/users', usersRoutes);
 app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/meals', mealRoutes);
 app.use('/api/v1/ingredients', ingredientRoutes);
+app.use('/api/v1/food-orders', foodOrdersRoutes);
 app.use('/api/v1/admin', adminRoutes);
 
 // 404 handler
@@ -58,7 +58,5 @@ app.use((req, res) => {
 
 // Error handling middleware (must be last)
 app.use(errorHandler);
-
-
 
 module.exports = app;
